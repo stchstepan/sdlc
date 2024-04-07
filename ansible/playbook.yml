@@ -1,0 +1,233 @@
+---
+- name: Copy and trust SSL certificates
+  hosts: dev
+  become: yes
+  vars:
+    certificate_path: /opt/gitlab/ssl/nginx-selfsigned.crt
+    key_path: /opt/gitlab/ssl/nginx-selfsigned.key
+
+  tasks:
+    - name: Copy SSL certificate to remote server
+      copy:
+        src: "{{ certificate_path }}"
+        dest: "/etc/ssl/certs/nginx-selfsigned.crt"
+        mode: "0644"
+
+    - name: Copy SSL key to remote server
+      copy:
+        src: "{{ key_path }}"
+        dest: "/etc/ssl/private/nginx-selfsigned.key"
+        mode: "0600"
+
+    - name: Update ca-certificates
+      command: update-ca-certificates
+      changed_when: false
+
+- name: Add entries to /etc/hosts
+  hosts: dev
+  become: yes
+  tasks:
+    - name: Configure DNS
+      lineinfile:
+        path: /etc/hosts
+        line: "{{ item }}"
+        state: present
+      with_items:
+        - "192.168.0.24 git.cherkashin-sdlc.ru"
+        - "192.168.0.24 vault.cherkashin-sdlc.ru"
+
+- name: Install Docker and Docker Compose for developer user
+  hosts: dev
+  become: yes
+
+  tasks:
+    - name: Create developer user
+      user:
+        name: developer
+        password: "{{ 'change_me' | password_hash('sha512') }}"
+        state: present
+
+    - name: Force developer user to change password on first login
+      shell: chage -d 0 developer
+      become: true
+
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+
+    - name: Install required system packages
+      apt:
+        name: 
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - software-properties-common
+        state: present
+
+    - name: Add Docker GPG key
+      apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+
+    - name: Add Docker APT repository
+      apt_repository:
+        repo: "deb [arch=amd64] https://download.docker.com/linux/ubuntu {{ ansible_lsb.codename }} stable"
+        state: present
+
+    - name: Install Docker
+      apt:
+        name: docker-ce
+        state: present
+
+    - name: Add developer user to Docker group
+      user:
+        name: developer
+        groups: docker
+        append: yes
+
+    - name: Configure Docker to use git.cherkashin-sdlc.ru registry
+      copy:
+        dest: /etc/docker/daemon.json
+        content: |
+          {
+            "insecure-registries": ["git.cherkashin-sdlc.ru"]
+          }
+
+    - name: Restart Docker service
+      service:
+        name: docker
+        state: restarted
+
+    - name: Check if Docker Compose is already installed
+      stat:
+        path: /usr/local/bin/docker-compose
+      register: docker_compose_installed
+
+    - name: Install Docker Compose if not already installed
+      get_url:
+        url: https://github.com/docker/compose/releases/download/1.29.2/docker-compose-Linux-x86_64
+        dest: /usr/local/bin/docker-compose
+        mode: '0755'
+      when: not docker_compose_installed.stat.exists
+
+- name: Install gitleaks
+  hosts: dev
+  become: yes
+
+  tasks:
+    - name: Check if gitleaks is already installed
+      stat:
+        path: /usr/local/bin/gitleaks
+      register: gitleaks_installed
+
+    - name: Install gitleaks if not already installed
+      shell: |
+        wget https://github.com/gitleaks/gitleaks/releases/download/v8.18.2/gitleaks_8.18.2_linux_x64.tar.gz -O /tmp/gitleaks.tar.gz
+        tar -xzvf /tmp/gitleaks.tar.gz -C /tmp
+        mv /tmp/gitleaks /usr/local/bin/gitleaks
+        chmod +x /usr/local/bin/gitleaks
+      when: not gitleaks_installed.stat.exists
+
+- name: Check for secrets in all projects before git commit
+  hosts: dev
+  gather_facts: no
+
+  tasks:
+    - name: Find all Git repositories
+      find:
+        paths: "/"
+        recurse: yes
+        patterns: ".git"
+      register: git_repos
+      changed_when: false
+
+    - name: Extract directory names from Git repositories
+      set_fact:
+        repo_dirs: "{{ git_repos.files | map(attribute='path') | map('dirname') | unique }}"
+
+    - name: Get the current working directory
+      command: pwd
+      register: current_working_dir
+      changed_when: false
+
+    - name: Run gitleaks to check for secrets in each project
+      shell: gitleaks --repo-path={{ current_working_dir.stdout }}/{{ item }}
+      register: gitleaks_output
+      with_items: "{{ repo_dirs }}"
+      changed_when: false
+
+    - name: Fail if gitleaks finds secrets in any project
+      fail:
+        msg: "Gitleaks обнаружил секреты в одном или нескольких проектах. Пожалуйста, исправьте это."
+      when: gitleaks_output.results | map(attribute='stdout') | join('\n') != ""
+
+- name: Install Visual Studio Code and CodeQL extension on Ubuntu
+  hosts: dev
+  become: yes
+
+  tasks:
+    - name: Install apt-transport-https
+      apt:
+        name: apt-transport-https
+        state: present
+
+    - name: Add Microsoft GPG key
+      apt_key:
+        url: https://packages.microsoft.com/keys/microsoft.asc
+        state: present
+
+    - name: Add VS Code repository
+      apt_repository:
+        repo: "deb [arch=amd64] https://packages.microsoft.com/repos/vscode stable main"
+        state: present
+
+    - name: Install Visual Studio Code
+      apt:
+        name: code
+        state: present
+
+    - name: Install CodeQL extension for VS Code
+      community.general.code_extension:
+        extension: "GitHub.vscode-codeql"
+
+- name: Install HashiCorp Vault client
+  hosts: dev
+  become: yes
+
+  tasks:
+    - name: Install HashiCorp Vault client
+      apt:
+        name: vault
+        state: present
+
+- name: Transfer encrypted Vault token to Ubuntu host and add it to authorized tokens
+  hosts: dev
+  become: yes
+
+  vars_prompt:
+    - name: vault_token
+      prompt: "Enter your Vault token"
+      private: yes
+
+  tasks:
+    - name: Create plaintext token file
+      ansible.builtin.copy:
+        content: "{{ vault_token }}"
+        dest: "/tmp/vault_token.txt"
+
+    - name: Encrypt token file using Ansible Vault
+      ansible.builtin.command: ansible-vault encrypt "/tmp/vault_token.txt" --vault-password-file="/path/to/vault_password.txt"
+
+    - name: Transfer encrypted token file to Ubuntu host
+      ansible.builtin.copy:
+        src: "/tmp/vault_token.txt"
+        dest: "/home/ubuntu/vault_token.txt"
+        mode: "0600"
+
+    - name: Remove plaintext token file
+      ansible.builtin.file:
+        path: "/tmp/vault_token.txt"
+        state: absent
+
+    - name: Add token to authorized tokens
+      ansible.builtin.shell: vault token create -policy="dev" -id="{{ lookup('file', '/home/ubuntu/vault_token.txt') }}"

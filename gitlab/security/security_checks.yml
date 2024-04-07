@@ -1,0 +1,94 @@
+.SAST:
+  tags:
+    - shell
+  image:
+    name: returntocorp/semgrep
+  when: always
+  script: 
+    - semgrep --config=auto ./ --json -o gl-sast-report.json
+    - echo "Если вы видите в выводе/артефакте серьезные замечания безопасности, но при этом хотите задеплоить приложеник - событие будет залогировано"
+  artifacts:
+    expire_in: 7 day
+    paths:
+      - gl-sast-report.json
+
+.owasp_dependency_check:
+    image:
+        name: registry.gitlab.com/gitlab-ci-utils/docker-dependency-check:latest
+        entrypoint: [""]
+    script:
+        - /usr/share/dependency-check/bin/dependency-check.sh --scan "./" --format HTML --project "$CI_PROJECT_NAME"
+        - echo "Если вы видите в выводе/артефакте серьезные замечания безопасности, но при этом хотите задеплоить приложеник - событие будет залогировано"
+    artifacts:
+        expire_in: 7 day
+        when: always
+        paths:
+        - "./dependency-check-report.html"
+    tags:
+        - shell
+
+.trivy:
+  image:
+    name: aquasec/trivy:latest
+    entrypoint: [""]
+  tags:
+    - shell
+  variables:
+    DOCKER_HOST: tcp://docker:2375/
+  before_script:
+    - mkdir ./reports
+  script:
+    - trivy image ${IMAGE_NAME} -o ./reports/trivy-report.json -f json
+    - echo "Если вы видите в выводе/артефакте серьезные замечания безопасности, но при этом хотите задеплоить приложеник - событие будет залогировано"
+  artifacts:
+    name: "$CI_JOB_NAME report from $CI_PROJECT_NAME"
+    expire_in: 7 day
+    when: always
+    reports:
+      codequality:
+        - "./reports/trivy-report.json"
+    paths:
+      - "./reports/trivy-report.json"
+
+.hadolint:
+  tags:
+    - shell
+  image: 
+    name: registry.gitlab.com/pipeline-components/hadolint:latest
+  variables:
+    DOCKER_HOST: tcp://docker:2375/
+  before_script:
+    - mkdir ${CI_PROJECT_DIR}/reports
+  script: 
+    - hadolint --no-fail Dockerfile > ${CI_PROJECT_DIR}/reports/hadolint.json
+    - echo "Если вы видите в выводе/артефакте серьезные замечания безопасности, но при этом хотите задеплоить приложеник - событие будет залогировано"
+  artifacts:
+    name: "$CI_JOB_NAME report from $CI_PROJECT_NAME"
+    expire_in: 7 day
+    when: always
+    reports:
+      codequality:
+        - "${CI_PROJECT_DIR}/reports/hadolint.json"
+    paths:
+      - "${CI_PROJECT_DIR}/reports/hadolint.json"
+
+.owasp_zap_as_blackbox:
+    allow_failure: true
+    image:
+        name: owasp/zap2docker-stable
+    variables:
+        ZAP_REPORT: alert-report
+        ZAP_ALERT_REPORT: baselinescan
+    before_script:
+        - mkdir -p /zap/wrk
+    script:
+        - /zap/zap-full-scan.py -d -t https://passbolt.cherkashin-sdlc.ru/ -r ${CI_PROJECT_DIR}/${ZAP_REPORT}.html -w ${CI_PROJECT_DIR}/${ZAP_ALERT_REPORT}.md returnCode 0
+        - echo "Если вы видите в выводе/артефакте серьезные замечания безопасности, но при этом хотите задеплоить приложеник - событие будет залогировано"
+    tags:
+        - shell
+    artifacts:
+        when: always
+        expire_in: 30 days    
+        paths:
+            - ${CI_PROJECT_DIR}/${ZAP_REPORT}.html
+            - ${CI_PROJECT_DIR}/${ZAP_ALERT_REPORT}.md

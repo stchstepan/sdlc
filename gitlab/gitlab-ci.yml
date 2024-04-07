@@ -1,0 +1,58 @@
+stages:
+  - build
+  - security_checks
+  - deploy
+
+include:
+    project: stch_stepa/security
+    file: security_checks.yml
+
+Build Image:
+  stage: build
+  tags: 
+    - shell
+  variables:
+    CI_REGISTRY_IMAGE: git.cherkashin-sdlc.ru/passbolt
+  before_script:
+    - echo "${REGISTRY_PWD}" | docker login -u "${REGISTRY_LOGIN}" "${REGISTRY_URL}" --password-stdin
+  script:
+    - docker build --no-cache -t ${CI_REGISTRY_IMAGE}:latest .
+    - docker push ${CI_REGISTRY_IMAGE}:latest
+
+SAST:
+    stage: security
+    extends: .SAST
+    when: always
+
+SCA_depcheck:
+    stage: security
+    extends: .owasp_dependency_check
+    when: always
+
+linter:
+    stage: security
+    extends: .hadolint
+    when: always
+
+image_scan:
+    stage: security
+    extends: .trivy
+    when: always
+    variables:
+        DEPTRACK_API_KEY: ${IMAGE_NAME}
+
+Deploy:
+  tags: 
+    - shell
+  stage: deploy
+  needs:
+    - msg
+  when: manual
+  before_script:
+    - echo "${REGISTRY_PWD}" | docker login -u "${REGISTRY_LOGIN}" "${REGISTRY_URL}" --password-stdin
+  script:
+    - ssh -T $SSH_CONNECTION "[[ -d /opt/passbolt ]] || sudo mkdir -p /opt/passbolt"
+    - ssh -T $SSH_CONNECTION "if [[ -d /opt/passbolt ]]; then sudo rm -rf /opt/passbolt/*; else echo 'Directory /opt/passbolt not found, creating new directory'; fi"
+    - ssh -T $SSH_CONNECTION "cd /opt/passbolt && sudo git clone https://${USERNAME}@${CI_REGISTRY_NAME} ."
+    - ssh -T $SSH_CONNECTION "cd /opt/passbolt && docker-compose up -d"
+    - ssh -T $SSH_CONNECTION "echo 'Событие деплоя было залогировано - $(date)' >> /var/logs/prod/logs.log"
